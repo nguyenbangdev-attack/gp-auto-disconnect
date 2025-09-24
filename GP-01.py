@@ -1,0 +1,164 @@
+import requests
+import xml.etree.ElementTree as ET
+import urllib3
+from datetime import datetime
+import logging
+
+# Tắt các cảnh báo về SSL certificate không an toàn
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def setup_logging():
+    """
+    Thiết lập hệ thống logging để ghi ra file và console.
+    Tên file log sẽ được đặt theo ngày hiện tại (ví dụ: iiop_disconnect_log_2025-09-25.txt).
+    """
+    # Lấy ngày hiện tại để đặt tên file log
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"gp_disconnect_log_{today_str}.txt"
+
+    # Xóa các handlers cũ nếu có để tránh ghi log lặp lại
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    # Cấu hình logging cơ bản
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S',
+                        handlers=[
+                            logging.FileHandler(log_filename, mode='a', encoding='utf-8'), # Log to a daily file
+                            logging.StreamHandler() # Log to console
+                        ])
+
+def get_api_key(ip, username, password):
+    """
+    Lấy API key bằng phương thức POST để bảo mật thông tin đăng nhập.
+    """
+    url = f"https://{ip}/api/?type=keygen"
+    payload = {'user': username, 'password': password}
+
+    try:
+        response = requests.post(url, data=payload, verify=False, timeout=10)
+        response.raise_for_status() # Báo lỗi nếu status code là 4xx hoặc 5xx
+
+        root = ET.fromstring(response.text)
+        if root.get('status') == 'success':
+            api_key = root.find('.//key').text
+            logging.info("Lấy API Key thành công!")
+            return api_key
+        else:
+            error_msg = root.find('.//msg').text
+            logging.error(f"Lỗi khi lấy API Key: {error_msg}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Đã xảy ra lỗi request khi lấy API Key: {e}")
+        return None
+
+def get_current_gp_users(ip, key, gpgateway):
+    """
+    Lấy danh sách người dùng GlobalProtect đang kết nối.
+    """
+    cmd = f"<show><global-protect-gateway><current-user><gateway>{gpgateway}</gateway></current-user></global-protect-gateway></show>"
+    url = f"https://{ip}/api/?type=op&cmd={cmd}&key={key}"
+
+    try:
+        response = requests.get(url, verify=False, timeout=10)
+        response.raise_for_status()
+        logging.info(f"Lấy danh sách người dùng từ gateway '{gpgateway}' thành công.")
+        return response.text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Lỗi khi lấy danh sách người dùng GP: {e}")
+        return None
+
+def disconnect_user(ip, key, gpgateway, user, computer):
+    """
+    Ngắt kết nối một người dùng cụ thể khỏi một máy tính cụ thể.
+    """
+    gateway_logout = f"{gpgateway}-N"
+    cmd = f"<request><global-protect-gateway><client-logout><gateway>{gateway_logout}</gateway><reason>force-logout</reason><user>{user}</user><computer>{computer}</computer></client-logout></global-protect-gateway></request>"
+    url = f"https://{ip}/api/?type=op&cmd={cmd}&key={key}"
+
+    try:
+        response = requests.get(url, verify=False, timeout=10)
+        response.raise_for_status()
+        logging.info(f"Đã gửi yêu cầu ngắt kết nối cho user '{user}' trên máy '{computer}'.")
+        return response.text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Lỗi khi ngắt kết nối user '{user}': {e}")
+        return None
+
+def find_and_disconnect_duplicates(xml_data, ip, key, gpgateway):
+    """
+    Phân tích XML, tìm người dùng có nhiều phiên, giữ lại phiên cũ nhất và ngắt các phiên còn lại.
+    """
+    if not xml_data:
+        logging.warning("Không có dữ liệu XML để xử lý.")
+        return
+
+    user_sessions = {}
+    try:
+        root = ET.fromstring(xml_data)
+
+        now = datetime.now()
+        for entry in root.findall('.//entry'):
+            username = entry.find('username').text
+            computer = entry.find('computer').text
+            login_time_str = entry.find('login-time').text
+
+            time_format = '%b.%d %H:%M:%S'
+            parsed_time = datetime.strptime(login_time_str, time_format)
+            login_time_obj = parsed_time.replace(year=now.year)
+
+            if login_time_obj > now:
+                login_time_obj = login_time_obj.replace(year=now.year - 1)
+
+            session_details = {
+                'computer': computer,
+                'login_time': login_time_obj
+            }
+
+            if username not in user_sessions:
+                user_sessions[username] = []
+            user_sessions[username].append(session_details)
+
+        logging.info("Bắt đầu kiểm tra và xử lý các phiên đăng nhập trùng lặp...")
+
+        for user, sessions in user_sessions.items():
+            if len(sessions) > 1:
+                sessions.sort(key=lambda s: s['login_time'])
+
+                oldest_session = sessions[0]
+                newer_sessions = sessions[1:]
+
+                logging.warning(f"Phát hiện user '{user}' đăng nhập từ {len(sessions)} máy. Sẽ chỉ giữ lại phiên cũ nhất.")
+                logging.info(f"Giữ lại phiên của user '{user}': Máy '{oldest_session['computer']}' (đăng nhập lúc {oldest_session['login_time']})")
+
+                for session_to_disconnect in newer_sessions:
+                    logging.info(f"Ngắt kết nối phiên của user '{user}': Máy '{session_to_disconnect['computer']}' (đăng nhập lúc {session_to_disconnect['login_time']})")
+                    disconnect_user(ip, key, gpgateway, user, session_to_disconnect['computer'])
+
+    except (ET.ParseError, ValueError) as e:
+        logging.error(f"Lỗi khi xử lý dữ liệu: {e}")
+
+# --- KHỐI THỰC THI CHÍNH ---
+if __name__ == "__main__":
+    # --- THIẾT LẬP LOGGING ---
+    setup_logging()
+
+       # --- THAY ĐỔI CÁC THÔNG SỐ NÀY ---
+    FIREWALL_IP = "xxxx"  # Thay bằng IP của firewall
+    USERNAME    = "xxx"            # Thay bằng username có quyền API
+    PASSWORD    = "xxxxx"      # Thay bằng mật khẩu
+    GP_GATEWAY  = "xxx"    # Thay bằng tên GlobalProtect Gateway của bạn
+    # ------------------------------------
+
+    logging.info(f"--- Bắt đầu kịch bản trên Firewall {FIREWALL_IP} ---")
+
+    api_key = get_api_key(FIREWALL_IP, USERNAME, PASSWORD)
+
+    if api_key:
+        gp_users_xml = get_current_gp_users(FIREWALL_IP, api_key, GP_GATEWAY)
+
+        if gp_users_xml:
+            find_and_disconnect_duplicates(gp_users_xml, FIREWALL_IP, api_key, GP_GATEWAY)
+
+    logging.info("--- Kịch bản hoàn tất. ---")
